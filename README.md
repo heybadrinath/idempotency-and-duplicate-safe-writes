@@ -114,6 +114,59 @@ Supplied tests check:
 
 Do not change tests.
 
+## Implemented Contract
+
+Send one `Idempotency-Key` for each logical incident and reuse that key for retries.
+Keys must be non-blank and at most 255 characters. Invalid keys or incident
+payloads return `400` before any writes. The exercise authentication middleware
+supplies `req.user.tenantId`; the handler never takes its tenant scope from the
+request body. In a real deployment, replace the exercise header-based middleware
+with verified authentication.
+
+The database primary key is `(tenant_id, operation, key)`, with the fixed operation
+`POST:/incidents`. An insert claims ownership before creating an incident. A
+concurrent insert waits on PostgreSQL's unique constraint until the owner commits
+or rolls back. On commit, duplicates replay the stored `201` status and JSON body,
+with `Idempotent-Replayed: true`. Application-level lookup followed by insert
+would leave a race in which two processes could both create an incident.
+
+The request hash is SHA-256 over canonical JSON: object keys are sorted
+recursively, array order is preserved, and JSON scalar values retain their
+types. Reordering object properties is harmless; changing a value, array order,
+or the set of properties changes the hash. An unexpired key bound to a different
+request returns `409 idempotency_key_conflict`. A matching record still marked
+`processing` returns `409 operation_in_progress`; a matching `failed` record
+returns `409 prior_operation_failed`. Neither state automatically executes the
+request again because the previous outcome may need investigation.
+
+Keys expire 24 hours after the successful claim. An expired row can be reclaimed
+atomically by the next request, including a new request body. Expiry ends the
+deduplication guarantee: retrying after 24 hours may create another incident.
+Clients must not interpret expiry as proof that the original operation failed.
+The expiry index also supports later retention cleanup; no background cleanup
+worker is required for reclaiming a key.
+
+The key claim, incident, one durable paging job, and stored response commit in a
+single transaction. If any step fails, all local writes roll back and a retry
+can claim the key again. No external queue or paging provider is called within
+the transaction. A worker can deliver committed jobs later, using the stable
+job ID for provider-side deduplication: this database guarantee does not make
+external delivery exactly once by itself.
+
+Stored responses contain incident titles and identifiers, so treat the replay
+table as tenant data, restrict access, and include it in retention and deletion
+policies. This endpoint stores only its small incident response, never arbitrary
+request headers or credentials. Larger endpoints should bound replay-response
+size and avoid caching sensitive fields unnecessarily.
+
+## Validation
+
+The 14 supplied tests pass unchanged with Node.js 26 and PostgreSQL 16. They
+include 20 concurrent duplicates and verify one incident and one paging job.
+Additional local checks passed for concurrent expiry reclamation, concurrent
+requests with conflicting payloads, and a forced paging-job failure that rolls
+back every local write before a successful retry.
+
 ## Submit Pull Request
 
 ```bash
